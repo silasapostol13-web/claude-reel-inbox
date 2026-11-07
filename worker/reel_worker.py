@@ -411,6 +411,14 @@ def process_url(url: str, note: str, sent_at: str = "", source: dict | str | Non
             meta["uploader"] = info.get("channel") or info.get("uploader")
             meta["caption"] = info.get("description") or ""
             meta["title"] = (meta["caption"].split("\n")[0][:80] if meta["caption"] else None) or info.get("title")
+            # No note: the folder was named after the link. Name it after the post instead.
+            url_slug = slugify(url)
+            better = slugify(meta["title"] or meta["uploader"] or "")
+            if not note and out.name.endswith(url_slug) and better != "reel":
+                renamed = out.with_name(out.name[: -len(url_slug)] + better)
+                if not renamed.exists():
+                    out = out.rename(renamed)
+                    rid = meta["id"] = out.name
             duration = duration_of(video)
             meta["duration"] = duration
             prompt = " ".join(filter(None, [meta.get("uploader"), meta["caption"][:300]]))
