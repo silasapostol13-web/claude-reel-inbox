@@ -168,7 +168,7 @@ means Claude looks at them instead of guessing from the text. The unread count r
 through the server's own instructions, with no hooks or settings changes.
 
 **Nothing fails silently.** A failed reel gets a folder with a plain-English reason ("Instagram
-wouldn't hand over this video without a login…"). It's retried after 5, 10 and 15 minutes, and if the
+won't show this post without logging in…"). It's retried after 5, 10 and 15 minutes, and if the
 Mac is offline right after waking it waits instead of using up retries. After 4 tries it moves to
 `failed/` with the error inside.
 
@@ -195,7 +195,9 @@ the first real share.
   can be gaps. Keep it current with `brew upgrade yt-dlp`. Public Reels download without a login
   today. Private posts, and anything that needs a login, fail with a clear message. The worker never
   uses your browser cookies.
-- **Photo posts and carousels** have no video, so they're recorded as failed with that reason.
+- **Photo posts and carousels** work too, through the same `yt-dlp` (no extra tool). Every photo slide
+  becomes a frame with its text read off it, video slides inside a carousel are transcribed like a
+  short video, and the post caption is kept. Up to 20 slides per post.
 - **OCR is imperfect** on stylized captions, tiny terminal text and motion blur. That's why the
   frames themselves are always passed along.
 - **Mac only**, because the worker uses Apple's Vision framework and launchd. The phone side needs

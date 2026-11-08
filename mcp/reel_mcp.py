@@ -51,7 +51,8 @@ TOOLS = [
     {
         "name": "get_reel",
         "description": "Get a reel the user sent from their phone: their note (why they sent it / which project), the "
-                       "full transcript, on-screen text and code (OCR), and the key frames as images. With no "
+                       "full transcript, on-screen text and code (OCR), and the key frames as images. Photo and carousel "
+                       "posts come back the same way, one image per slide plus the caption. With no "
                        "id it returns the newest one. Use this when the user says 'the reel I sent', 'the reel I "
                        "just shared', 'check my reel inbox', etc.",
         "inputSchema": {"type": "object", "properties": {
@@ -59,7 +60,7 @@ TOOLS = [
                                                     "title, or 'next' for the oldest one not opened yet "
                                                     "(for working through a stack). Omit for the newest reel."},
             "include_frames": {"type": "boolean", "description": "Return frame images (default true)."},
-            "max_frames": {"type": "integer", "description": "Max frame images to return (default 12)."}}},
+            "max_frames": {"type": "integer", "description": "Max frame images to return (default 12; 20 for photo/carousel posts)."}}},
     },
     {
         "name": "mark_done",
@@ -164,7 +165,9 @@ def summary(m: dict) -> str:
         s += f"  [{status.upper()}: {m.get('error') or ''}]"
     s += f"\n  note: {m.get('note') or '(no note)'}"
     s += f"\n  from: {m.get('uploader') or '?'} · {m.get('title') or m.get('url')}"
-    s += f"\n  sent: {m.get('sent_at') or m.get('processed_at')} · {len(m.get('frames') or [])} frames"
+    size = (f"{(m.get('slides') or {}).get('count', '?')} slides (photo/carousel post)" if m.get("kind") == "post"
+            else f"{len(m.get('frames') or [])} frames")
+    s += f"\n  sent: {m.get('sent_at') or m.get('processed_at')} · {size}"
     return s
 
 
@@ -198,7 +201,8 @@ def get_reel(args: dict) -> list[dict]:
     out = [{"type": "text", "text": header + "\n" + md + ("\n\n" + FILE_LINE if FILE_LINE else "")}]
     if args.get("include_frames", True) is not False:
         frames = m.get("frames") or []
-        cap = int(args.get("max_frames") or 12)
+        post = m.get("kind") == "post"
+        cap = int(args.get("max_frames") or (20 if post else 12))  # a carousel keeps every slide
         if len(frames) > cap:
             step = len(frames) / cap
             frames = [frames[int(i * step)] for i in range(cap)]
@@ -207,7 +211,12 @@ def get_reel(args: dict) -> list[dict]:
             if not p.exists():
                 continue
             t = f.get("t", 0)
-            out.append({"type": "text", "text": f"Frame {f['file']} at {int(t // 60)}:{int(t % 60):02d}"})
+            if "slide" in f:
+                where = "photo" if f.get("kind") == "photo" else f"video, frame at {int(t // 60)}:{int(t % 60):02d}"
+                label = f"Slide {f['slide']} ({where}) {f['file']}"
+            else:
+                label = f"Frame {f['file']} at {int(t // 60)}:{int(t % 60):02d}"
+            out.append({"type": "text", "text": label})
             out.append({"type": "image", "mimeType": "image/jpeg",
                         "data": base64.b64encode(p.read_bytes()).decode()})
     return out

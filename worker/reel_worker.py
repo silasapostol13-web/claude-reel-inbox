@@ -4,7 +4,8 @@
 Watches the iCloud folder the phone Shortcut writes into. For each new item it
 downloads the video (yt-dlp), transcribes it locally (whisper.cpp), picks the
 important frames (ffmpeg scene changes + Vision similarity), and reads on-screen
-text (Vision OCR). Output: ~/ReelInbox/<id>/reel.md, meta.json, frames/*.jpg.
+text (Vision OCR). Photo and carousel posts work too: every photo slide becomes a
+frame, video slides are handled like short videos, all in slide order. Output: ~/ReelInbox/<id>/reel.md, meta.json, frames/*.jpg.
 
 Stdlib only. Run by launchd (install.sh sets it up). Safe to run by hand any time:
     python3 worker/reel_worker.py            # process everything pending
@@ -55,6 +56,7 @@ FFPROBE = shutil.which("ffprobe") or f"{BREW}/ffprobe"
 WHISPER = shutil.which("whisper-cli") or f"{BREW}/whisper-cli"
 
 MAX_FRAMES = 12
+POST_MAX_FRAMES = 20  # a carousel can have 20 slides; keep every one
 MAX_ATTEMPTS = 4
 URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 
@@ -176,17 +178,19 @@ def slugify(text: str, n: int = 6) -> str:
 
 # ---------------------------------------------------------------- media steps
 
+LOGIN_HINT = ("Instagram won't show this post without logging in, so Reel Inbox can't get it. That usually "
+              "means a private account, an age-restricted post, or Instagram hiding it from logged-out "
+              "visitors for a while. Reel Inbox never logs in to Instagram. It will try again a few times "
+              "in case it's a short block; if it keeps failing, take screenshots or a screen recording and "
+              "send those instead.")
+
+
 def explain_download_error(err: str) -> str:
     e = err.lower()
     if "empty media response" in e or "login" in e or "cookies" in e or "private" in e:
-        hint = ("Instagram/TikTok would not hand over this video without a login. Usually a private, "
-                "deleted or age-restricted post, or a temporary block. Open the link in a browser to check. "
-                "If it plays there while logged out, try again later; Reel Inbox can't fetch posts that need "
-                "a login.")
+        hint = LOGIN_HINT
     elif "unsupported url" in e:
-        hint = "That link isn't a video yt-dlp knows how to download (photo post, profile or story link?)."
-    elif "no video" in e or "no formats" in e:
-        hint = "No video in this post (probably a photo or carousel post)."
+        hint = "That link isn't a post yt-dlp knows how to read (a profile or story link?)."
     elif "unable to download" in e or "timed out" in e or "network" in e or "resolve" in e:
         hint = "Network problem while downloading; it will be retried."
     else:
@@ -194,25 +198,72 @@ def explain_download_error(err: str) -> str:
     return f"{hint} (yt-dlp said: {err[:300]})"
 
 
-def download(url: str, work: Path) -> tuple[Path, dict]:
+def probe(url: str) -> dict:
+    """Read the post without downloading anything. One request to Instagram either way: the video
+    download below reuses this (--load-info-json), so videos cost no extra round trip.
+    --ignore-no-formats-error keeps photo slides in the result instead of failing on them."""
     try:
-        _download(url, work)
+        p = run([YTDLP, "--yes-playlist", "--playlist-items", "1:20", "--ignore-no-formats-error",
+                 "--no-warnings", "--dump-single-json", url], timeout=180)
     except RuntimeError as e:
         raise RuntimeError(explain_download_error(str(e))) from None
-    vids = [p for p in work.glob("video.*") if p.suffix not in (".json", ".part")]
+    return json.loads(p.stdout)
+
+
+def slides_of(info: dict) -> list[dict]:
+    """A carousel comes back as a playlist of slides; a reel or single photo as one item."""
+    if info.get("_type") == "playlist":
+        return [e for e in info.get("entries") or [] if e]
+    return [info]
+
+
+def is_video(entry: dict) -> bool:
+    return bool(entry.get("formats") or entry.get("url"))
+
+
+def download_video(entry: dict, work: Path, name: str) -> Path:
+    info_file = work / f"{name}.probe.json"
+    info_file.write_text(json.dumps(entry))
+    try:
+        run([YTDLP, "--no-progress", "-f", "b[ext=mp4]/bv*+ba/b", "--merge-output-format", "mp4",
+             "--load-info-json", str(info_file), "-o", str(work / f"{name}.%(ext)s")], timeout=300)
+    except RuntimeError as e:
+        raise RuntimeError(explain_download_error(str(e))) from None
+    vids = [p for p in work.glob(f"{name}.*") if p.suffix not in (".json", ".part")]
     if not vids:
-        raise RuntimeError("No video in this post (probably a photo or carousel post).")
-    info = {}
-    info_path = work / "video.info.json"
-    if info_path.exists():
-        info = json.loads(info_path.read_text())
-    return vids[0], info
+        raise RuntimeError("yt-dlp finished but no video file came out.")
+    return vids[0]
 
 
-def _download(url: str, work: Path) -> None:
-    run([YTDLP, "--no-playlist", "--no-progress", "-f", "b[ext=mp4]/bv*+ba/b",
-         "--merge-output-format", "mp4", "--write-info-json",
-         "-o", str(work / "video.%(ext)s"), url], timeout=300)
+def image_url(entry: dict) -> str | None:
+    """yt-dlp lists a photo's sizes as thumbnails, best last; 'thumbnail' is its pick of the best."""
+    thumbs = [t for t in entry.get("thumbnails") or [] if t.get("url")]
+    return entry.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+
+
+def download_image(entry: dict, dest: Path) -> None:
+    import urllib.request
+    url = image_url(entry)
+    if not url:
+        raise RuntimeError("Instagram gave no image for this slide.")
+    headers = {"User-Agent": "Mozilla/5.0", **(entry.get("http_headers") or {})}
+    last: Exception | None = None
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+                data = r.read()
+            if len(data) < 1000:
+                raise RuntimeError(f"image too small ({len(data)} bytes)")
+            tmp = dest.with_suffix(".download")
+            tmp.write_bytes(data)
+            # Normalise to JPEG (Instagram sometimes serves webp/heic); sips ships with macOS.
+            run(["/usr/bin/sips", "-s", "format", "jpeg", str(tmp), "--out", str(dest)])
+            tmp.unlink()
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2)
+    raise RuntimeError(f"Couldn't download a photo slide: {last}")
 
 
 def duration_of(video: Path) -> float:
@@ -252,7 +303,7 @@ def transcribe(video: Path, work: Path, prompt: str) -> list[dict]:
 def extract_candidates(video: Path, work: Path, duration: float) -> list[tuple[Path, float]]:
     """Scene-change frames plus a steady sample (every ~1.5s) so slow screen recordings aren't missed."""
     cand = work / "cand"
-    cand.mkdir()
+    cand.mkdir(parents=True)
     probe = run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate",
                  "-of", "csv=p=0", str(video)]).stdout.strip()
     try:
@@ -359,22 +410,54 @@ def fmt_t(sec: float) -> str:
     return f"{int(sec // 60)}:{int(sec % 60):02d}"
 
 
+def slides_line(meta: dict) -> str:
+    s = meta.get("slides") or {}
+    parts = [f"{s.get('photos')} photo" + ("s" if s.get("photos") != 1 else "")] if s.get("photos") else []
+    if s.get("videos"):
+        parts.append(f"{s['videos']} video" + ("s" if s["videos"] != 1 else ""))
+    return f"{s.get('count', '?')} slide" + ("s" if s.get("count") != 1 else "") + \
+        (f" ({', '.join(parts)})" if parts else "")
+
+
 def write_reel_md(out: Path, meta: dict, segs: list[dict]) -> None:
-    L = [f"# Reel: {meta.get('title') or meta['id']}", ""]
+    post = meta.get("kind") == "post"
+    size = (f"**Slides:** {slides_line(meta)}" if post
+            else f"**Length:** {fmt_t(meta.get('duration') or 0)}")
+    L = [f"# {'Post' if post else 'Reel'}: {meta.get('title') or meta['id']}", ""]
     L += [f"- **Sender's note:** {meta['note'] or '(no note)'}",
           f"- **URL:** {meta['url']}",
           f"- **Sent:** {meta.get('sent_at') or '?'}  ·  **Processed:** {meta.get('processed_at')}",
-          f"- **Creator:** {meta.get('uploader') or '?'}  ·  **Length:** {fmt_t(meta.get('duration') or 0)}",
+          f"- **Creator:** {meta.get('uploader') or '?'}  ·  {size}",
           f"- **Status:** {meta['status']}" + (f" — {meta['error']}" if meta.get("error") else ""), ""]
+    if post:
+        L += ["This is a photo/carousel post, not a single video. Each slide is a frame below, in order, "
+              "with the text read off it.", ""]
     if meta.get("caption"):
         L += ["## Post caption", "", meta["caption"].strip(), ""]
-    L += ["## Transcript", ""]
-    if segs:
-        L += [f"[{fmt_t(s['start'])}] {s['text']}" for s in segs]
-    else:
-        L.append("(no speech found)" if meta["status"] == "ok" else "(not available)")
-    L.append("")
-    if meta.get("frames"):
+    if meta.get("slide_errors"):
+        L += ["## Slides that couldn't be fetched", ""]
+        L += [f"- Slide {e['slide']} ({e['kind']}): {e['error']}" for e in meta["slide_errors"]]
+        L.append("")
+    if not post or (meta.get("slides") or {}).get("videos"):  # a photos-only post has nothing to transcribe
+        L += ["## Transcript", ""]
+        if segs:
+            L += [(f"[slide {s['slide']} · {fmt_t(s['start'])}] " if "slide" in s else f"[{fmt_t(s['start'])}] ")
+                  + s["text"] for s in segs]
+        else:
+            L.append("(no speech found)" if meta["status"] == "ok" else "(not available)")
+        L.append("")
+    if post and meta.get("frames"):
+        L += ["## Slides and on-screen text", "",
+              "Lines already shown on an earlier slide (like the creator's handle) are left out.", ""]
+        for f in meta["frames"]:
+            where = "photo" if f["kind"] == "photo" else f"video, frame at {fmt_t(f['t'])}"
+            L.append(f"### Slide {f['slide']} ({where}) — {f['file']}")
+            if f["ocr"]:
+                L += ["```", *f["ocr"], "```"]
+            else:
+                L.append("(no new text)")
+            L.append("")
+    elif meta.get("frames"):
         L += ["## Frames and on-screen text", "",
               "Subtitle lines that just repeat the speech, and lines already shown on an earlier frame, "
               "are left out.", ""]
@@ -386,6 +469,84 @@ def write_reel_md(out: Path, meta: dict, segs: list[dict]) -> None:
                 L.append("(no new text)")
             L.append("")
     (out / "reel.md").write_text("\n".join(L))
+
+
+def caption_prompt(meta: dict) -> str:
+    return " ".join(filter(None, [meta.get("uploader"), (meta.get("caption") or "")[:300]]))
+
+
+def process_video(entry: dict, work: Path, out: Path, meta: dict) -> list[dict]:
+    """A reel / TikTok: transcript plus the key frames with their on-screen text."""
+    video = download_video(entry, work, "video")
+    duration = duration_of(video)
+    meta["duration"] = duration
+    segs = transcribe(video, work, caption_prompt(meta))
+    transcript = " ".join(s["text"] for s in segs)
+    cands = extract_candidates(video, work, duration)
+    if cands:
+        vis = vision([c[0] for c in cands])
+        kept = pick_frames(cands, vis)
+        ocr = clean_ocr([vis["images"][i]["text"] for i in kept], transcript)
+        for n, (i, lines) in enumerate(zip(kept, ocr), 1):
+            name = f"{n:02d}_{fmt_t(cands[i][1]).replace(':', 'm')}s.jpg"
+            shutil.copy(cands[i][0], out / "frames" / name)
+            meta["frames"].append({"file": f"frames/{name}", "t": round(cands[i][1], 2), "ocr": lines})
+    meta["transcript"] = segs
+    return segs
+
+
+def process_post(slides: list[dict], work: Path, out: Path, meta: dict) -> list[dict]:
+    """A photo or carousel post. Every photo slide becomes one frame; a video slide gets transcribed and
+    gives its few key frames. All of them go through the same OCR as video frames, in slide order."""
+    n_vid = sum(1 for s in slides if is_video(s))
+    n_photo = len(slides) - n_vid
+    meta["kind"] = "post"
+    meta["slides"] = {"count": len(slides), "photos": n_photo, "videos": n_vid}
+    meta["slide_errors"] = []
+    per_video = max(1, min(4, (POST_MAX_FRAMES - n_photo) // max(1, n_vid)))
+    picked: list[list] = []  # [image path, frame info, ocr text or None]
+    segs: list[dict] = []
+    duration = 0.0
+    for n, s in enumerate(slides, 1):
+        sw = work / f"slide{n:02d}"
+        sw.mkdir()
+        kind = "video" if is_video(s) else "photo"
+        try:
+            if kind == "photo":
+                img = sw / "photo.jpg"
+                download_image(s, img)
+                picked.append([img, {"slide": n, "kind": "photo", "t": 0}, None])
+                continue
+            video = download_video(s, sw, "video")
+            dur = duration_of(video)
+            duration += dur
+            segs += [{**seg, "slide": n} for seg in transcribe(video, sw, caption_prompt(meta))]
+            cands = extract_candidates(video, sw, dur)
+            if cands:
+                vis = vision([c[0] for c in cands])
+                for i in pick_frames(cands, vis, cap=per_video):
+                    picked.append([cands[i][0], {"slide": n, "kind": "video", "t": round(cands[i][1], 2)},
+                                   vis["images"][i]["text"]])
+        except Exception as e:  # noqa: BLE001 — one bad slide shouldn't sink the whole post
+            log(f"slide {n} ({kind}) of {meta['url']} failed: {e}")
+            meta["slide_errors"].append({"slide": n, "kind": kind, "error": str(e)[:300]})
+    if not picked:
+        errs = "; ".join(f"slide {e['slide']}: {e['error']}" for e in meta["slide_errors"])
+        raise RuntimeError(f"Couldn't get any slide of this post. {errs}"[:800])
+    photos = [k for k, p in enumerate(picked) if p[2] is None]
+    if photos:
+        vis = vision([picked[k][0] for k in photos])
+        for k, im in zip(photos, vis["images"]):
+            picked[k][2] = im["text"]
+    ocr = clean_ocr([p[2] for p in picked], " ".join(s["text"] for s in segs))
+    for idx, ((path, f, _), lines) in enumerate(zip(picked, ocr), 1):
+        tail = "photo" if f["kind"] == "photo" else f"video_{fmt_t(f['t']).replace(':', 'm')}s"
+        name = f"{idx:02d}_slide{f['slide']:02d}_{tail}.jpg"
+        shutil.copy(path, out / "frames" / name)
+        meta["frames"].append({"file": f"frames/{name}", **f, "ocr": lines})
+    meta["duration"] = duration
+    meta["transcript"] = segs
+    return segs
 
 
 def process_url(url: str, note: str, sent_at: str = "", source: dict | str | None = None,
@@ -407,9 +568,14 @@ def process_url(url: str, note: str, sent_at: str = "", source: dict | str | Non
     with tempfile.TemporaryDirectory(prefix="reelinbox-") as tmp:
         work = Path(tmp)
         try:
-            video, info = download(url, work)
-            meta["uploader"] = info.get("channel") or info.get("uploader")
-            meta["caption"] = info.get("description") or ""
+            info = probe(url)
+            slides = slides_of(info)
+            if not slides:
+                raise RuntimeError("yt-dlp read the post but found nothing in it (no video or photos).")
+            first = slides[0]
+            meta["uploader"] = (info.get("channel") or info.get("uploader")
+                                or first.get("channel") or first.get("uploader"))
+            meta["caption"] = info.get("description") or first.get("description") or ""
             meta["title"] = (meta["caption"].split("\n")[0][:80] if meta["caption"] else None) or info.get("title")
             # No note: the folder was named after the link. Name it after the post instead.
             url_slug = slugify(url)
@@ -419,22 +585,11 @@ def process_url(url: str, note: str, sent_at: str = "", source: dict | str | Non
                 if not renamed.exists():
                     out = out.rename(renamed)
                     rid = meta["id"] = out.name
-            duration = duration_of(video)
-            meta["duration"] = duration
-            prompt = " ".join(filter(None, [meta.get("uploader"), meta["caption"][:300]]))
-            segs = transcribe(video, work, prompt)
-            transcript = " ".join(s["text"] for s in segs)
-            cands = extract_candidates(video, work, duration)
-            if cands:
-                vis = vision([c[0] for c in cands])
-                kept = pick_frames(cands, vis)
-                ocr = clean_ocr([vis["images"][i]["text"] for i in kept], transcript)
-                for n, (i, lines) in enumerate(zip(kept, ocr), 1):
-                    name = f"{n:02d}_{fmt_t(cands[i][1]).replace(':', 'm')}s.jpg"
-                    shutil.copy(cands[i][0], out / "frames" / name)
-                    meta["frames"].append({"file": f"frames/{name}", "t": round(cands[i][1], 2), "ocr": lines})
+            if len(slides) == 1 and is_video(first):
+                segs = process_video(first, work, out, meta)
+            else:
+                segs = process_post(slides, work, out, meta)
             meta["status"] = "ok"
-            meta["transcript"] = segs
         except Exception as e:  # noqa: BLE001 — every failure is written into the output, never swallowed
             meta["status"] = "failed"
             meta["error"] = str(e)[:800]

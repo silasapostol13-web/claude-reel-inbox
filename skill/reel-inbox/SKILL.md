@@ -15,6 +15,8 @@ through the `reel-inbox` MCP server.
   opened yet), one at a time. A reel only stops counting as new once you open it.
 - At session start the server says how many new reels are waiting; mention it in one line, then do
   what the user asked. Don't open them unless asked.
+- Photo and carousel posts come back the same way: the caption, then one frame per slide in order
+  with its text. Read every slide; the point is often on a later one.
 - Read **the note first**. It says what they want from the reel (a tool to try, an idea for a
   project, a technique). Use the transcript, the OCR text and the frames together. Look at the frames
   for code, repo names, settings and UI that the transcript doesn't say out loud.
